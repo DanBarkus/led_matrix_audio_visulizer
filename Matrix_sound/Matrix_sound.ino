@@ -5,6 +5,7 @@
 #include <SPI.h>
 #include <SD.h>
 #include <SerialFlash.h>
+#include <Math.h>
 
 //#include <SmartLEDShieldV4.h>  // comment out this line for if you're not using SmartLED Shield V4 hardware (this line needs to be before #include <SmartMatrix3.h>)
 #include <SmartMatrix3.h>
@@ -18,11 +19,12 @@ const uint8_t kDmaBufferRows = 4;       // known working: 2-4, use 2 to save mem
 const uint8_t kPanelType = SMARTMATRIX_HUB75_32ROW_MOD16SCAN; // use SMARTMATRIX_HUB75_16ROW_MOD8SCAN for common 16x32 panels, or use SMARTMATRIX_HUB75_64ROW_MOD32SCAN for common 64x64 panels
 const uint8_t kMatrixOptions = (SMARTMATRIX_OPTIONS_NONE);      // see http://docs.pixelmatix.com/SmartMatrix for options
 const uint8_t kBackgroundLayerOptions = (SM_BACKGROUND_OPTIONS_NONE);
-const uint8_t freqBands = 32;
+const uint8_t freqBands = 64;
 
 SMARTMATRIX_ALLOCATE_BUFFERS(matrix, kMatrixWidth, kMatrixHeight, kRefreshDepth, kDmaBufferRows, kPanelType, kMatrixOptions);
 SMARTMATRIX_ALLOCATE_BACKGROUND_LAYER(backgroundLayer, kMatrixWidth, kMatrixHeight, COLOR_DEPTH, kBackgroundLayerOptions);
 
+// microphone input pin
 #define ADC_INPUT_PIN   A14
 
 AudioInputAnalog         input(ADC_INPUT_PIN);
@@ -35,7 +37,7 @@ AudioConnection          audioConnection(input, 0, fft, 0);
 float scale = 0.0;
 
 // used to quell the screen when there is no audio
-float scaleCutoff = 5000.0;
+float scaleCutoff = 8000.0;
 
 // An array to hold the 32 frequency bands
 float level[freqBands];
@@ -52,10 +54,18 @@ int shown[freqBands];
 // used for auto-scaling with volume
 float maxVal = 0.0;
 
+float currMaxVal = 0.0;
+
+float brightnessScalar = 5000.0;
+
+int lastBrightness = 0;
+
 // How long to wait before decreasing scale to account for lower volume
-unsigned long maxResetTime = 5.0 * 1000;
+unsigned long maxResetTime = 1.0 * 1000;
 // Last time scale was reset
 unsigned long lastReset = 0.0;
+// how long to fade the scale change over
+unsigned long fadeDuration = 5.0 * 1000;
 
 // Time in ms before lowering the white bars one line
 int fallTime = 200;
@@ -75,6 +85,7 @@ void setup()
 
     // Initialize Matrix
     matrix.addLayer(&backgroundLayer); 
+    backgroundLayer.enableColorCorrection(true);
     matrix.begin();
 
     matrix.setBrightness(255);
@@ -87,6 +98,14 @@ void loop()
 {
     // did each channel reach a new maximum this sample
     // used to move white bar up
+    int brightness = sq(currMaxVal) * brightnessScalar;
+    brightness = constrain(brightness, 0, 255);
+    if (brightness != lastBrightness) {
+        Serial.println(brightness);
+        matrix.setBrightness(brightness);
+        lastBrightness = brightness;
+    }
+    
     bool newPeak[freqBands] = {false};
 
     
@@ -94,7 +113,10 @@ void loop()
 
     // see if we reset the scaling due to timeout from quiet sounds
     if (currTime > lastReset + maxResetTime) {
-          maxVal = 0;
+            // Serial.println(maxVal);
+            currMaxVal = lerp(lastReset + maxResetTime, currTime, lastReset + maxResetTime + fadeDuration, maxVal, 0);
+            
+            // maxVal = 0;
      }
      
     if (fft.available()) {
@@ -103,50 +125,21 @@ void loop()
         // is linear, so for the higher octaves, read
         // many FFT bins together.
 
-        level[0] = fft.read(2);
-        level[1] = fft.read(3);
-        level[2] = fft.read(4);
-        level[3] = fft.read(5);
-        level[4] = fft.read(6);
-        level[5] = fft.read(7);
-        level[6] = fft.read(8);
-        level[7] = fft.read(9);
-        level[8] = fft.read(10);
-        level[9] = fft.read(11);
-        level[10] = fft.read(12);
-        level[11] = fft.read(13, 14);
-        level[12] = fft.read(15, 16);
-        level[13] = fft.read(17, 19);
-        level[14] = fft.read(20, 22);
-        level[15] = fft.read(23, 25);
-        level[16] = fft.read(26, 28);
-        level[17] = fft.read(29, 31);
-        level[18] = fft.read(32, 34);
-        level[19] = fft.read(35, 38);
-        level[20] = fft.read(39, 43);
-        level[21] = fft.read(44, 47);
-        level[22] = fft.read(48, 52);
-        level[23] = fft.read(53, 57);
-        level[24] = fft.read(58, 63);
-        level[25] = fft.read(64, 69);
-        level[26] = fft.read(70, 78);
-        level[27] = fft.read(79, 85);
-        level[28] = fft.read(86, 92);
-        level[29] = fft.read(93, 102);
-        level[30] = fft.read(103, 115);
-        level[31] = fft.read(116, 127);
+
+        readFFT(128, freqBands);
 
         // check if we need to scale to account for louder sounds
         for (int i = 0; i < freqBands; i++) {
-          if (level[i] > maxVal) {
+          if (level[i] > currMaxVal) {
             maxVal = level[i];
+            currMaxVal = maxVal;
             lastReset = currTime;
           }
         }
         
         // calculate scale so loudest value fits on the display
-        scale = (kMatrixHeight - 1) / maxVal;
-        Serial.println(scale);
+        scale = (kMatrixHeight - 1) / currMaxVal;
+        // Serial.println(scale);
 
 //        if (scale > scaleCutoff) {
 //          scale = scaleCutoff;
@@ -202,15 +195,15 @@ void loop()
                 lvl[i] = fallLevel[i];
               }
                 // scale the bars horizontally to fill the matrix width
-                for (int j = 0; j < kMatrixWidth / 16; j++) {
+                for (int j = 0; j < (kMatrixWidth / freqBands); j++) {
                     for (int k = 0; k <= val; k++) {
 
                       // color is based on distance from bottom of display
                       SM_RGB color = CRGB(CHSV((128 - k * 4), 255, 255));
-                      backgroundLayer.drawPixel(i * 4 + j, kMatrixHeight - k, color);
+                      backgroundLayer.drawPixel(i * (kMatrixWidth / freqBands) + j, kMatrixHeight - k, color);
 
                       // draw white bar
-                      backgroundLayer.drawPixel(i * 4 + j, kMatrixHeight - lvl[i], barColor);
+                      backgroundLayer.drawPixel(i * (kMatrixWidth / freqBands) + j, kMatrixHeight - lvl[i], barColor);
                     }
                 }
             }
@@ -218,4 +211,51 @@ void loop()
 
         backgroundLayer.swapBuffers();
     }
+}
+
+float lerp(float startTime, float currTime, float stopTime, float startValue, float endValue) {
+    float timeOffset = currTime - startTime;
+    float timePct = timeOffset / (stopTime - startTime);
+    float output = startValue - (startValue * timePct);
+    output = constrain(output,endValue, startValue);
+    return output;
+}
+
+void readFFT (int fftSize, int numBars) {
+
+    float max = pow(2.0,((numBars - 1)/12.0))-1;
+    float scalar = (fftSize - 3) / max;
+    int bucket[numBars];
+    for (int i = 0; i <= numBars; i++) {
+        bucket[i] = (pow(2.0,(i/12.0))-1)*scalar + 2;
+        if (i > 0 && bucket[i] <= bucket[i-1]) {
+            bucket[i] = bucket[i-1] + 1;
+        }
+    }
+    int minBucket[numBars] = {2};
+    for (int i = 1; i <= numBars; i++) {
+        if (bucket[i] - bucket[i-1] > 1) {
+            minBucket[i] = bucket[i-1] + 1;
+        }
+        else {
+            minBucket[i] = bucket[i];
+        }
+    }
+
+    for (int i = 0; i <= numBars; i++) {
+        if (minBucket[i] == bucket[i]) {
+            level[i] = fft.read(bucket[i]);
+        }
+        else {
+            level[i] = fft.read(minBucket[i], bucket[i]);
+            level[i] = level[i] / (bucket[i] - minBucket[i] + 1);
+        }
+        level[i] *= (float(minBucket[i])) / (fftSize);
+        level[i] *= numBars;
+        // Serial.print(minBucket[i] + ", ");
+        // Serial.println(minBucket[i]);
+    }
+
+        
+    
 }
